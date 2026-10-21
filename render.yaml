@@ -1,0 +1,19 @@
+# Render (https://render.com) · servidor de salas de TENNIS POWER (protocolo 2, E3.17).
+# Plan GRATIS, una sola instancia (las salas viven en la memoria del proceso: no se debe escalar a más).
+# Si este archivo está en la raíz del repositorio (repositorio solo del servidor), funciona tal cual.
+# Si el servidor está dentro de la carpeta server/ de otro repositorio, agrega:  rootDir: server
+services:
+  - type: web
+    name: tennis-power-salas
+    runtime: node
+    plan: free
+    region: ohio
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ALLOWED_ORIGINS
+        value: ""

@@ -1,0 +1,125 @@
+# Servidor de salas · MULTIJUGADOR de TENNIS POWER (E3.17 · protocolo 2)
+
+El 1 contra 1 en línea necesita este pequeño servidor. No guarda partidas, cuentas, monedas ni contraseñas.
+
+**Qué hace**
+
+- **Salas privadas:** crea salas con un código de 5 letras y deja entrar a una sola persona más.
+- **Preparación:** cada jugador elige su personaje y toca LISTO. Cuando los dos están listos, el partido empieza.
+- **Partido:** revisa y reenvía los controles de uno a otro (unos 60 mensajes pequeños por segundo).
+- **Resultado por consenso:** al terminar, los dos juegos mandan su final. Si coinciden, el servidor lo confirma a los dos. Si no coinciden, el partido queda **sin resultado**.
+- **Reconexión:** si alguien pierde la red un momento, le guarda el lugar 20 segundos.
+- **Revancha y salida:** organiza la revancha y avisa si el rival sale.
+
+## Cómo funciona el partido (lockstep)
+
+1. Los dos juegos simulan **el mismo partido**, con las mismas reglas, la misma semilla y los valores base de los personajes.
+2. Solo viajan los **controles**, numerados por tick (1/60 s) y con el **número de partido**. Un mensaje de un partido anterior nunca entra en la revancha.
+3. Cada control se aplica con un **retardo de entrada** igual para los dos, así que nadie tiene ventaja. El retardo se calcula con el ping real: de 3 a 15 ticks (50–250 ms).
+4. Si falta un control del rival, el juego **espera** en vez de inventarlo, y avisa «Esperando a tu rival…».
+5. Cada medio segundo, el invitado manda una **huella** de su estado. Si no coincide con la del anfitrión, el anfitrión le manda una **foto** del estado.
+   - El invitado solo acepta fotos con la **forma exacta** de su simulador: clases de una lista fija, las mismas variables y los mismos tipos.
+
+**Velocidad.** El partido en línea va a la misma velocidad que uno normal: 1 control y 1 tick por cuadro. Solo se pone al día tras una espera.
+
+Esto se corrigió en E3.17. Antes, dos juegos podían empujarse uno al otro hasta ir casi al doble de velocidad.
+
+## Qué protege y qué NO
+
+**Lo que sí revisa el servidor:**
+
+- Que cada jugador pertenezca a su sala y solo mande controles de su propio lado.
+- La forma, el tipo, el tamaño y los rangos de cada mensaje.
+- El número de partido y el orden de los ticks. Los duplicados y los atrasados se descartan, y nadie puede ir más de 90 ticks por delante del otro.
+- Las transiciones válidas: sala → partido → final → revancha.
+- Que el final se procese **una sola vez**.
+- Los límites:
+  - salas y conexiones en total, y conexiones por IP;
+  - mensajes por segundo: con más de 240 se cierra la conexión;
+  - códigos equivocados: 40 por IP cada 10 minutos.
+- Que los códigos sean aleatorios. Son 33 millones de combinaciones, con el freno de intentos de arriba.
+- La **ficha privada** de cada jugador para reconectar. Es aleatoria y nunca se le manda al rival.
+
+**Lo que NO es (dicho tal cual):**
+
+- **El servidor no simula el partido.** Un juego modificado podría mandar controles «imposibles pero bien formados», y el anfitrión podría mandar una foto falsa con la forma correcta.
+  - El final por consenso evita que **uno solo** imponga el resultado.
+  - Pero si el anfitrión engaña al invitado con fotos falsas, los dos podrían terminar de acuerdo en un resultado falso.
+  - La protección completa exige simular el partido en el servidor (Godot sin pantalla), y eso no cabe bien en el plan gratuito (0.1 CPU). Es la ruta futura si algún día el online da premios.
+- **`Origin`, el código de sala y la versión del juego no son autenticación.**
+  - La cabecera `Origin` solo frena que otras páginas web usen el servidor. La app de iPhone no la manda y siempre se acepta.
+  - El código de sala solo sirve para encontrar la sala.
+- El online **no da** monedas, XP, premios ni progreso, y se juega con los valores base (sin mejoras compradas). Por eso esta protección se considera proporcionada para las pruebas privadas.
+
+## Reinicios y límites del plan gratis
+
+- Las salas viven en la **memoria** de este proceso. Debe correr **una sola instancia** (el plan gratis de Render no permite más).
+- Si el servidor se reinicia o se vuelve a desplegar, las salas y partidos en curso **se pierden**. Los juegos lo detectan y dicen «el partido terminó sin resultado».
+- Salas sin actividad:
+  - En espera: se cierran a los 30 minutos.
+  - Terminadas: a los 10 minutos.
+  - Un partido sin controles durante 60 segundos termina sin resultado.
+- **Render gratis** ([documentación](https://render.com/docs/free)):
+  - Se **duerme tras 15 minutos** sin tráfico y tarda **~1 minuto** en despertar. El juego lo espera hasta 100 s mostrando «Despertando el servidor…», con CANCELAR.
+  - 750 horas al mes y 5 GB de salida al mes.
+  - **Sin tarjeta registrada, si se pasa no cobra: suspende** el servicio hasta el mes siguiente.
+  - Puede reiniciarlo en cualquier momento.
+
+## Consumo medido (pruebas en esta computadora)
+
+| | Valor |
+|---|---|
+| Datos por partido | ~6 KB/s de entrada y ~6 KB/s de salida |
+| Salida por hora de partido | ~21 MB (solo datos), ~47 MB con cabeceras TLS/TCP (estimado) |
+| 5 GB al mes | ≈ 100–240 horas de partido |
+| 20 partidos a la vez | 9 % de un núcleo de esta computadora (Render gratis da 0.1 CPU) |
+
+**Capacidad teórica sin medir en Render:**
+
+| Partidos simultáneos | Qué esperar |
+|---|---|
+| 2 | Sobra |
+| 10 | Probablemente bien |
+| 20 | Puede quedarse corto de CPU |
+
+No se promete ninguna cantidad de jugadores hasta probarla en el servidor real.
+
+**Vigilar el consumo:**
+
+- En Render: **Dashboard → tu workspace → Billing** (ancho de banda del mes).
+- Los registros (Logs) del servicio muestran cada 10 minutos una línea `resumen:` con salas, conexiones, partidos y MB enviados.
+- `https://TU-SERVICIO.onrender.com/health` muestra salas, conexiones y partidos en ese momento.
+
+## Probarlo en tu computadora
+
+1. Instala Node.js 20 o más nuevo.
+2. En la carpeta `server` ejecuta `npm install` y luego `npm start`. Debe aparecer `escuchando en 0.0.0.0:8090`.
+3. Abre dos veces el juego de pruebas (Godot o la web de pruebas): usa `ws://localhost:8090` solo.
+
+**Pruebas automáticas:** `npm test` (47 comprobaciones). Las pruebas del juego con este servidor real están en `tests/test_runner.gd` y se ejecutan con `--only=e317`.
+
+`prueba_retardo.js` es **solo para pruebas**: un intermediario que añade retraso de red.
+
+## Variables
+
+Ver `.env.example`. No hay secretos.
+
+| Variable | Para qué |
+|---|---|
+| `PORT` | Puerto (Render lo pone solo) |
+| `HOST` | Interfaz de red |
+| `NODE_VERSION` | Versión de Node en Render |
+| `ALLOWED_ORIGINS` | Webs permitidas |
+| `MAX_ROOMS`, `MAX_CONNECTIONS`, `MAX_CONN_PER_IP` | Límites |
+| `RESUME_MS` | Cuánto se guarda el lugar de quien pierde la red |
+
+## Despliegue
+
+- **Render:** ver `GUIA_RENDER.md` en la entrega (paso a paso, sin tarjeta). `render.yaml` sirve como Blueprint.
+- **Otros alojamientos con Docker** (Koyeb, Fly.io, un VPS): `Dockerfile`.
+  - Koyeb pide tarjeta al registrarse, aunque su servicio gratuito no se cobra.
+
+## Licencias
+
+- `servidor_salas.js` y `prueba_*.js` son código original del proyecto.
+- Usa la librería `ws` (licencia MIT), que se instala con `npm ci`.
