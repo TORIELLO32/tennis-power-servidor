@@ -1,13 +1,18 @@
-// Pruebas automáticas del servidor de salas (E3.17 · protocolo 2): arranca el servidor en un puerto libre
+// Pruebas automáticas del servidor de salas (E3.18 · protocolo 3; el 2 sigue aceptado): arranca el servidor en un puerto libre
 // y simula clientes reales por WebSocket. Uso: npm test
 // Comprueba: crear/unirse, códigos inválidos, sala llena, versiones, origen (web vs app nativa), LISTO,
 // inicio, entradas validadas (duplicadas, atrasadas, de otro partido, mal formadas), fin por consenso,
 // sin resultado si no coinciden, revancha, reconexión, abandono, reinicio del servidor, salud, límites y
 // varias salas a la vez. Al final mide el tamaño real del tráfico de un partido.
+// E3.18: niveles de mejoras en línea (validación y reparto en "start"), compatibilidad con el protocolo 2 y
+// verificación de compras de App Store (/iap/verify) con una cadena de certificados DE PRUEBA (server/pruebas).
 "use strict";
 const { spawn } = require("child_process");
 const http = require("http");
+const fs = require("fs");
+const crypto = require("crypto");
 const WebSocket = require("ws");
+const { verifyJws, APPLE_ROOT_G3_SHA256 } = require("./verificar_compras");
 
 let PORT = 18000 + Math.floor(Math.random() * 1000);
 let ok = 0, bad = 0;
@@ -15,12 +20,41 @@ function check(c, msg) {
   if (c) { ok++; console.log("  OK   " + msg); } else { bad++; console.log("  FALLA " + msg); }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const P = 2;
-const VER = "0.3.17";
+const P = 3;
+const VER = "0.3.18";
+
+// ---- E3.18 · transacciones firmadas DE PRUEBA (misma forma que las de Apple, otra raíz)
+const T = __dirname + "/pruebas/";
+const derB64 = (pem) => new crypto.X509Certificate(fs.readFileSync(T + pem)).raw.toString("base64");
+const TEST_CHAIN = ["hoja_prueba.pem", "intermedio_prueba.pem", "raiz_prueba.pem"].map(derB64);
+const TEST_ROOT_FP = crypto.createHash("sha256").update(new crypto.X509Certificate(fs.readFileSync(T + "raiz_prueba.pem")).raw).digest("hex").toUpperCase();
+const TEST_KEY = crypto.createPrivateKey(fs.readFileSync(T + "hoja_prueba.key"));
+const b64u = (b) => Buffer.from(b).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+function makeJws(over = {}, chain = TEST_CHAIN, key = TEST_KEY) {
+  const payload = Object.assign({ transactionId: "2000000123456789", originalTransactionId: "2000000123456789",
+    bundleId: "com.eduardotoriello.tennispower", productId: "com.eduardotoriello.tennispower.xp850", type: "Consumable",
+    environment: "Sandbox", purchaseDate: Date.now() - 1000, signedDate: Date.now(), quantity: 1 }, over);
+  const head = b64u(JSON.stringify({ alg: "ES256", x5c: chain }));
+  const body = b64u(JSON.stringify(payload));
+  const sig = crypto.sign("sha256", Buffer.from(head + "." + body), { key, dsaEncoding: "ieee-p1363" });
+  return head + "." + body + "." + b64u(sig);
+}
+function post(path, obj) {
+  return new Promise((resolve) => {
+    const data = typeof obj === "string" ? obj : JSON.stringify(obj);
+    const req = http.request({ host: "127.0.0.1", port: PORT, path, method: "POST", headers: { "Content-Type": "application/json" } }, (res) => {
+      let b = "";
+      res.on("data", (d) => (b += d));
+      res.on("end", () => { let j = {}; try { j = JSON.parse(b); } catch (e) {} resolve({ status: res.statusCode, json: j }); });
+    });
+    req.on("error", () => resolve({ status: 0, json: {} }));
+    req.end(data);
+  });
+}
 
 function startServer(env = {}) {
   const srv = spawn(process.execPath, [__dirname + "/servidor_salas.js"], {
-    env: Object.assign({}, process.env, { PORT: String(PORT), HOST: "127.0.0.1" }, env),
+    env: Object.assign({}, process.env, { PORT: String(PORT), HOST: "127.0.0.1", IAP_ALLOW_TEST_ROOT: "1", IAP_TEST_ROOT_SHA256: TEST_ROOT_FP }, env),
   });
   srv.out = "";
   srv.stdout.on("data", (d) => (srv.out += d.toString()));
@@ -79,11 +113,11 @@ async function pair(nameA = "Ana", nameB = "Beto") {
   const h = await get("/health");
   let hj = {};
   try { hj = JSON.parse(h.body); } catch (e) {}
-  check(h.status === 200 && hj.ok === true && hj.proto === P && typeof hj.boot === "string", "página de salud /health con protocolo y arranque");
+  check(h.status === 200 && hj.ok === true && hj.proto === P && JSON.stringify(hj.protos) === "[2,3]" && typeof hj.boot === "string", "página de salud /health con protocolo 3 (acepta 2 y 3) y arranque");
   check((await get("/nada")).status === 404, "rutas desconocidas: 404");
   const a = await client(), b = await client(), c = await client();
   await sleep(100);
-  check(a.last("hello") && a.last("hello").proto === P, "saludo del servidor con la versión del protocolo");
+  check(a.last("hello") && a.last("hello").proto === 2 && a.last("hello").protos.includes(3), "saludo compatible: «proto 2» para el build anterior y «protos [2,3]» para el nuevo");
 
   console.log("\n[Salas: crear, unirse y errores]");
   a.j({ t: "create", proto: P, ver: VER, name: "Ana<script>", char: "nico", flag: "mx" });
@@ -102,7 +136,7 @@ async function pair(nameA = "Ana", nameB = "Beto") {
   check(b.last("error").e === "version" && b.last("error").need === VER, "versiones distintas del juego: «version»");
   b.j({ t: "join", proto: 1, ver: VER, code: room.code, name: "Beto", char: "lia" });
   await sleep(80);
-  check(b.last("error").e === "version" && b.last("error").server_proto === P, "protocolo viejo (build 1 de TestFlight): «version»");
+  check(b.last("error").e === "version" && b.last("error").server_proto === P, "protocolo 1 (muy viejo): «version»");
   b.j({ t: "join", proto: P, ver: VER, code: room.code.toLowerCase(), name: "Beto", char: "lia", flag: "AR" });
   await sleep(100);
   const rb = b.last("room");
@@ -117,6 +151,82 @@ async function pair(nameA = "Ana", nameB = "Beto") {
   a.j({ t: "hackear" });
   await sleep(60);
   check(a.last("error").e === "bad_msg", "mensaje desconocido: «bad_msg»");
+
+  console.log("\n[E3.18 · mejoras en línea]");
+  const ua = await client(), ub = await client();
+  ua.j({ t: "create", proto: 3, ver: "u1", name: "Uno", char: "nico", flag: "MX", ups: { speed: 5, power: 2, control: 0, recharge: 1 } });
+  await sleep(80);
+  const ucode = ua.last("room").code;
+  check(JSON.stringify(ua.last("room").players[0].ups) === JSON.stringify({ speed: 5, power: 2, control: 0, recharge: 1 }), "crear sala con niveles válidos (0..5): se guardan tal cual");
+  ub.j({ t: "join", proto: 3, ver: "u1", code: ucode, name: "Dos", char: "lia", ups: { speed: 9, power: 2, control: 0, recharge: 1 } });
+  await sleep(80);
+  check(JSON.stringify(ua.last("room").players[1].ups) === JSON.stringify({ speed: 0, power: 0, control: 0, recharge: 0 }), "niveles fuera de rango (velocidad 9): el jugador queda SIN mejoras");
+  ub.j({ t: "char", char: "kai", ups: { speed: 1.5, power: 0, control: 0, recharge: 0 } });
+  await sleep(80);
+  check(ub.last("error").e === "bad_ups" && JSON.stringify(ua.last("room").players[1].ups) === JSON.stringify({ speed: 0, power: 0, control: 0, recharge: 0 }), "decimales: rechazados («bad_ups»), sin mejoras");
+  ub.j({ t: "char", char: "kai", ups: { speed: 1, power: 0, control: 0, recharge: 0, extra: 3 } });
+  await sleep(80);
+  check(JSON.stringify(ua.last("room").players[1].ups.speed) === "0", "claves de más: rechazadas");
+  ub.j({ t: "char", char: "kai", ups: { speed: 4, power: 3, control: 2, recharge: 1 } });
+  await sleep(80);
+  check(ua.last("room").players[1].char === "kai" && ua.last("room").players[1].ups.power === 3, "cambiar de personaje manda los niveles de ESE personaje");
+  ua.j({ t: "ready", v: true, rtt: 40 });
+  ub.j({ t: "ready", v: true, rtt: 40 });
+  await sleep(120);
+  const us = ua.last("start"), us2 = ub.last("start");
+  check(us && us2 && JSON.stringify(us.ups) === JSON.stringify(us2.ups) && us.ups[0].speed === 5 && us.ups[1].speed === 4,
+    "el inicio lleva los niveles de los DOS jugadores, iguales en los dos teléfonos");
+  ua.close(); ub.close();
+  const oa = await client(), ob = await client();
+  oa.j({ t: "create", proto: 2, ver: "old", name: "Viejo", char: "nico", ups: { speed: 5, power: 5, control: 5, recharge: 5 } });
+  await sleep(80);
+  ob.j({ t: "join", proto: 2, ver: "old", code: oa.last("room").code, name: "Viejo2", char: "lia" });
+  await sleep(80);
+  oa.j({ t: "ready", v: true, rtt: 40 });
+  ob.j({ t: "ready", v: true, rtt: 40 });
+  await sleep(120);
+  check(oa.last("start") && oa.last("start").ups[0].speed === 0, "el build anterior (protocolo 2) sigue jugando, siempre sin mejoras en línea");
+  oa.close(); ob.close();
+
+  console.log("\n[E3.18 · verificación de compras]");
+  const vj = makeJws();
+  let r = await post("/iap/verify", { jws: vj, product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.status === 200 && r.json.verified === true && r.json.transactionId === "2000000123456789" && r.json.environment === "Sandbox" && r.json.revoked === false,
+    "compra firmada correcta: verificada (transacción, producto y entorno)");
+  r = await post("/iap/verify", { jws: vj, product: "com.eduardotoriello.tennispower.coins8000" });
+  check(r.json.verified === false && r.json.reason === "producto", "la transacción es de otro paquete: rechazada");
+  const parts = vj.split(".");
+  const evilP = JSON.parse(Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString());
+  evilP.productId = "com.eduardotoriello.tennispower.xp3900";
+  r = await post("/iap/verify", { jws: parts[0] + "." + b64u(JSON.stringify(evilP)) + "." + parts[2], product: "com.eduardotoriello.tennispower.xp3900" });
+  check(r.json.verified === false && r.json.reason === "firma", "contenido alterado (otro paquete) con la firma original: rechazado");
+  r = await post("/iap/verify", { jws: makeJws({ bundleId: "com.otra.app" }), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === false && r.json.reason === "app", "compra de otra app: rechazada");
+  r = await post("/iap/verify", { jws: makeJws({ type: "Non-Consumable" }), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === false && r.json.reason === "tipo", "producto que no es consumible: rechazado");
+  r = await post("/iap/verify", { jws: makeJws({ environment: "Xcode" }), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === false && r.json.reason === "entorno", "entorno Xcode (archivo .storekit local): rechazado salvo que se active a propósito");
+  r = await post("/iap/verify", { jws: makeJws({ revocationDate: Date.now() }), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === true && r.json.revoked === true, "compra reembolsada: verificada y marcada como reembolsada (el juego la retira)");
+  const otherKey = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey;
+  r = await post("/iap/verify", { jws: makeJws({}, TEST_CHAIN, otherKey), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === false && r.json.reason === "firma", "firmada con otra clave: rechazada");
+  r = await post("/iap/verify", { jws: makeJws({}, [derB64("hoja_sin_oid.pem"), TEST_CHAIN[1], TEST_CHAIN[2]]), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === false && (r.json.reason === "marca_apple" || r.json.reason === "firma"), "certificado sin la marca de Apple: rechazado");
+  r = await post("/iap/verify", { jws: makeJws({}, [TEST_CHAIN[0], TEST_CHAIN[2], TEST_CHAIN[1]]), product: "com.eduardotoriello.tennispower.xp850" });
+  check(r.json.verified === false, "cadena desordenada: rechazada");
+  r = await post("/iap/verify", "{no es json");
+  check(r.status === 400 && r.json.verified === false, "petición mal formada: 400");
+  const noTest = verifyJws(vj, "com.eduardotoriello.tennispower.xp850", { bundleId: "com.eduardotoriello.tennispower" });
+  check(noTest.verified === false && noTest.reason === "raiz", "SIN las variables de prueba, la raíz de prueba se rechaza (en Render solo vale Apple Root CA - G3)");
+  check(APPLE_ROOT_G3_SHA256 === "63343ABFB89A6A03EBB57E9B3F5FA7BE7C4F5C756F3017B3A8C488C3653E9179", "huella fija de Apple Root CA - G3 (la publicada por Apple)");
+  let lim = 0;
+  for (let i = 0; i < 40; i++) {
+    const x = await post("/iap/verify", { jws: "x", product: "" });
+    if (x.status === 429) lim++;
+  }
+  check(lim > 0, "demasiadas verificaciones seguidas desde la misma IP: se frenan (429)");
+  check(!srv.out.includes(vj.slice(0, 60)), "el registro del servidor no guarda las transacciones firmadas");
 
   console.log("\n[Preparación e inicio]");
   b.j({ t: "char", char: "dante" });

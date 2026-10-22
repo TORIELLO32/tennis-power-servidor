@@ -1,0 +1,16 @@
+[ root_ext ]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+[ inter_ext ]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+1.2.840.113635.100.6.2.1 = ASN1:NULL
+[ leaf_ext ]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid
+1.2.840.113635.100.6.11.1 = ASN1:NULL

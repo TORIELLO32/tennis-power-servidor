@@ -1,4 +1,4 @@
-// TENNIS POWER · Servidor de salas privadas 1 contra 1 (E3.17 · protocolo 2)
+// TENNIS POWER · Servidor de salas privadas 1 contra 1 (E3.18 · protocolo 3, acepta también el 2)
 // ---------------------------------------------------------------------------------------------
 // Qué hace:
 //   - Crea salas con un código de 5 letras, deja entrar a UNA segunda persona y avisa quién está.
@@ -14,6 +14,10 @@
 //     (No es una protección completa: el servidor no simula el partido. Ver LEEME_SERVIDOR.md.)
 //   - Avisa al otro si alguien se desconecta (espera hasta RESUME_MS a que vuelva) o sale, y organiza
 //     la REVANCHA cuando los dos aceptan.
+//   - E3.18: cada jugador manda sus NIVELES de mejoras de multijugador (enteros 0..5 por atributo). El servidor
+//     solo acepta enteros en ese rango y se los pasa a los dos juegos en "start"; cada juego calcula los mismos
+//     multiplicadores con la misma tabla. (No puede saber si el jugador los compró: no hay cuentas.)
+//   - E3.18: POST /iap/verify verifica compras de App Store firmadas por Apple (ver verificar_compras.js).
 // No guarda nada en disco, no pide cuentas y no da monedas ni premios. Las salas viven en la memoria
 // de ESTE proceso: si el servidor se reinicia, las salas y partidos en curso se pierden (los juegos
 // lo dicen con claridad). Por eso debe correr UNA sola instancia.
@@ -31,6 +35,7 @@
 const http = require("http");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
+const { verifyJws, optionsFromEnv } = require("./verificar_compras");
 
 const PORT = parseInt(process.env.PORT || "8090", 10);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -38,7 +43,12 @@ const ALLOWED = (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim
 const MAX_ROOMS = parseInt(process.env.MAX_ROOMS || "300", 10);
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || "400", 10);
 const MAX_CONN_PER_IP = parseInt(process.env.MAX_CONN_PER_IP || "12", 10);
-const PROTO = 2;
+const PROTO = 3;                 // E3.18: + niveles de mejoras en línea ("ups")
+const PROTOS = [2, 3];           // el 2 (build anterior) sigue funcionando: sus jugadores juegan sin mejoras en línea
+const UP_ATTRS = ["speed", "power", "control", "recharge"];
+const UP_MAX = 5;
+const IAP_OPTS = optionsFromEnv(process.env);
+const IAP_PER_MIN = parseInt(process.env.IAP_PER_MIN || "30", 10);
 const BOOT = crypto.randomBytes(4).toString("hex"); // cambia en cada arranque (los juegos detectan reinicios)
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sin O/0 ni I/1 (fáciles de confundir)
 
@@ -88,6 +98,22 @@ function cleanVer(s) {
 }
 const isInt = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
 
+// E3.18 · niveles de mejora en línea: exactamente {speed, power, control, recharge} con enteros 0..5.
+// Cualquier otra cosa (decimales, negativos, más de 5, claves extra) se rechaza y el jugador queda sin mejoras.
+function validUps(u) {
+  if (!u || typeof u !== "object" || Array.isArray(u)) return false;
+  const keys = Object.keys(u);
+  if (keys.length !== UP_ATTRS.length) return false;
+  return UP_ATTRS.every((a) => isInt(u[a], 0, UP_MAX));
+}
+function zeroUps() {
+  return { speed: 0, power: 0, control: 0, recharge: 0 };
+}
+function cleanUps(u) {
+  if (!validUps(u)) return zeroUps();
+  return { speed: u.speed, power: u.power, control: u.control, recharge: u.recharge };
+}
+
 // Una orden de un tick: [mx, my, flags, ax, ay] (enteros; ver LockstepSession.encode del juego).
 function validCmd(a) {
   return Array.isArray(a) && a.length === 5 && isInt(a[0], -1000, 1000) && isInt(a[1], -1000, 1000) &&
@@ -132,7 +158,7 @@ function roomInfo(room, you) {
     tok: me ? me.tok : "",
     m: room.match,
     players: room.players.map((p) =>
-      p ? { name: p.name, char: p.char, flag: p.flag, ready: p.ready, connected: !!p.ws } : null
+      p ? { name: p.name, char: p.char, flag: p.flag, ready: p.ready, connected: !!p.ws, ups: p.ups } : null
     ),
   };
 }
@@ -148,8 +174,10 @@ function other(room, idx) {
 }
 
 function newPlayer(ws, m) {
+  const proto = m.proto === 3 ? 3 : 2;
+  if (proto >= 3 && m.ups !== undefined && !validUps(m.ups)) stats.rejected += 1;
   return { ws, name: cleanName(m.name), char: cleanId(m.char), flag: cleanFlag(m.flag), ready: false, rtt: 80,
-    tok: crypto.randomBytes(12).toString("hex"), gone: 0 };
+    tok: crypto.randomBytes(12).toString("hex"), gone: 0, proto, ups: proto >= 3 ? cleanUps(m.ups) : zeroUps() };
 }
 
 function startMatch(room) {
@@ -183,6 +211,7 @@ function startMatch(room) {
     chars: [a.char, b.char],
     names: [a.name, b.name],
     flags: [a.flag, b.flag],
+    ups: [a.ups || zeroUps(), b.ups || zeroUps()],
   };
   room.startMsg = msg;
   log(`sala ${room.code}: partido ${room.match} (retardo ${delay} ticks, ping ${a.rtt}/${b.rtt} ms)`);
@@ -352,7 +381,7 @@ function handleEnd(ws, room, m) {
 function handleResume(ws, m) {
   const code = String(m.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5);
   const r = rooms.get(code);
-  if (m.proto !== PROTO) return send(ws, { t: "error", e: "version", server_proto: PROTO });
+  if (!PROTOS.includes(m.proto)) return send(ws, { t: "error", e: "version", server_proto: PROTO });
   if (!r) return send(ws, { t: "error", e: "resume_failed", why: "no_room" });
   const idx = r.players.findIndex((p) => p && typeof m.tok === "string" && p.tok === m.tok);
   if (idx < 0) return send(ws, { t: "error", e: "resume_failed", why: "token" });
@@ -416,7 +445,7 @@ function handle(ws, m) {
     case "end":
       return room && handleEnd(ws, room, m);
     case "create": {
-      if (m.proto !== PROTO) return send(ws, { t: "error", e: "version", server_proto: PROTO });
+      if (!PROTOS.includes(m.proto)) return send(ws, { t: "error", e: "version", server_proto: PROTO });
       if (room) dropPlayer(room, ws.idx, "left");
       if (rooms.size >= MAX_ROOMS) return send(ws, { t: "error", e: "server_full" });
       const code = newCode();
@@ -433,7 +462,7 @@ function handle(ws, m) {
       if (tooManyJoinFails(ws.ip)) return send(ws, { t: "error", e: "too_many" });
       const code = String(m.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
       if (code.length !== 5) return send(ws, { t: "error", e: "bad_code" });
-      if (m.proto !== PROTO) return send(ws, { t: "error", e: "version", server_proto: PROTO });
+      if (!PROTOS.includes(m.proto)) return send(ws, { t: "error", e: "version", server_proto: PROTO });
       const r = rooms.get(code);
       if (!r) {
         noteJoinFail(ws.ip);
@@ -458,6 +487,12 @@ function handle(ws, m) {
       const p = room.players[ws.idx];
       if (!p || p.ready) return; // con LISTO puesto no se cambia de personaje
       p.char = cleanId(m.char);
+      if (p.proto >= 3 && m.ups !== undefined) {
+        if (!validUps(m.ups)) {
+          p.ups = zeroUps();
+          reject(ws, "bad_ups");
+        } else p.ups = cleanUps(m.ups);
+      }
       p.ready = false;
       room.touched = Date.now();
       return broadcastRoom(room);
@@ -498,14 +533,56 @@ function handle(ws, m) {
 
 // ------------------------------------------------------------------ HTTP (salud) y WebSocket
 
+// E3.18 · verificación de compras: límite de peticiones por IP y por minuto (contra abusos)
+const iapHits = new Map(); // ip -> [marcas de tiempo]
+function iapTooMany(ip) {
+  const now = Date.now();
+  const arr = (iapHits.get(ip) || []).filter((t) => now - t < 60 * 1000);
+  arr.push(now);
+  iapHits.set(ip, arr);
+  return arr.length > IAP_PER_MIN;
+}
+
+function handleVerify(req, res) {
+  const reply = (code, obj) => {
+    res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(obj));
+  };
+  if (iapTooMany(clientIp(req))) return reply(429, { verified: false, reason: "demasiadas" });
+  let body = "";
+  let tooBig = false;
+  req.on("data", (c) => {
+    if (tooBig) return;
+    body += c;
+    if (body.length > 32 * 1024) tooBig = true;
+  });
+  req.on("end", () => {
+    if (tooBig) return reply(413, { verified: false, reason: "tamano" });
+    let m;
+    try {
+      m = JSON.parse(body);
+    } catch (e) {
+      return reply(400, { verified: false, reason: "formato" });
+    }
+    const r = verifyJws(m && m.jws, m && typeof m.product === "string" ? m.product : "", IAP_OPTS);
+    stats.iap = (stats.iap || 0) + 1;
+    if (r.verified) stats.iapOk = (stats.iapOk || 0) + 1;
+    // nunca se registra la transacción completa; solo el resultado
+    log(`compra: ${r.verified ? "verificada" : "rechazada (" + r.reason + ")"}${r.verified ? " " + r.product + " " + r.environment : ""}`);
+    return reply(200, r);
+  });
+}
+
 const server = http.createServer((req, res) => {
   const path = (req.url || "/").split("?")[0];
   if (path === "/" || path === "/health" || path === "/healthz") {
     // página de salud: Render la usa para saber que el servidor vive; el juego, para despertarlo
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    return res.end(JSON.stringify({ ok: true, juego: "TENNIS POWER", proto: PROTO, boot: BOOT,
-      salas: rooms.size, conexiones: stats.conns, partidos: stats.matches, uptime_s: Math.round(process.uptime()) }));
+    return res.end(JSON.stringify({ ok: true, juego: "TENNIS POWER", proto: PROTO, protos: PROTOS, boot: BOOT,
+      salas: rooms.size, conexiones: stats.conns, partidos: stats.matches, compras_verificadas: stats.iapOk || 0,
+      uptime_s: Math.round(process.uptime()) }));
   }
+  if (path === "/iap/verify" && req.method === "POST") return handleVerify(req, res);
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("no");
 });
@@ -572,7 +649,8 @@ wss.on("connection", (ws, req) => {
     onDisconnect(ws);
   });
   ws.on("error", () => {});
-  send(ws, { t: "hello", proto: PROTO, boot: BOOT });
+  // "proto": 2 se conserva para que el build anterior (que exige 2) siga entrando; los nuevos leen "protos".
+  send(ws, { t: "hello", proto: 2, protos: PROTOS, boot: BOOT });
 });
 
 // conexiones muertas (el teléfono se apagó sin cerrar): se detectan en ~20 s; salas caducadas
@@ -619,4 +697,4 @@ process.on("SIGINT", shutdown);
 
 server.listen(PORT, HOST, () => log(`TENNIS POWER · servidor de salas (protocolo ${PROTO}) escuchando en ${HOST}:${PORT}`));
 
-module.exports = { PROTO };
+module.exports = { PROTO, PROTOS };

@@ -1,4 +1,5 @@
-# Render (https://render.com) · servidor de salas de TENNIS POWER (protocolo 2, E3.17).
+# Render (https://render.com) · servidor de salas de TENNIS POWER (protocolo 3, E3.18; acepta también el 2) y verificación de compras.
+# (El servicio real de Eduardo se creó a mano con Docker; este archivo es la alternativa «Blueprint».)
 # Plan GRATIS, una sola instancia (las salas viven en la memoria del proceso: no se debe escalar a más).
 # Si este archivo está en la raíz del repositorio (repositorio solo del servidor), funciona tal cual.
 # Si el servidor está dentro de la carpeta server/ de otro repositorio, agrega:  rootDir: server

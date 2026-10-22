@@ -1,6 +1,8 @@
-# Servidor de salas · MULTIJUGADOR de TENNIS POWER (E3.17 · protocolo 2)
+# Servidor de salas y de compras · TENNIS POWER (E3.18 · protocolo 3, acepta el 2)
 
-El 1 contra 1 en línea necesita este pequeño servidor. No guarda partidas, cuentas, monedas ni contraseñas.
+El 1 contra 1 en línea necesita este pequeño servidor. Desde la E3.18 también **verifica las compras de App Store** antes de que el juego las acredite.
+
+No guarda partidas, cuentas, monedas ni contraseñas.
 
 **Qué hace**
 
@@ -10,6 +12,15 @@ El 1 contra 1 en línea necesita este pequeño servidor. No guarda partidas, cue
 - **Resultado por consenso:** al terminar, los dos juegos mandan su final. Si coinciden, el servidor lo confirma a los dos. Si no coinciden, el partido queda **sin resultado**.
 - **Reconexión:** si alguien pierde la red un momento, le guarda el lugar 20 segundos.
 - **Revancha y salida:** organiza la revancha y avisa si el rival sale.
+- **E3.18 · Mejoras en línea:** cada jugador manda los NIVELES (0..5) de sus mejoras de multijugador. El servidor solo acepta enteros en ese rango y se los reparte a los dos juegos en el inicio del partido; cada juego calcula los mismos multiplicadores con la misma tabla.
+- **E3.18 · Compras:** `POST /iap/verify` comprueba una compra firmada por Apple (ver abajo).
+
+## Versiones (protocolo)
+
+- **3 (E3.18):** como el 2 + niveles de mejoras en línea (`ups`) en `create`, `join`, `char` y en el inicio (`start.ups`).
+- **2 (E3.17):** se sigue aceptando. El build 1.0 (2) de TestFlight entra y juega igual, siempre sin mejoras en línea.
+  - El saludo conserva `proto: 2` para él y añade `protos: [2, 3]` para el nuevo.
+- Dos jugadores solo comparten sala si tienen la **misma versión del juego** (el juego lo dice si no).
 
 ## Cómo funciona el partido (lockstep)
 
@@ -39,6 +50,9 @@ Esto se corrigió en E3.17. Antes, dos juegos podían empujarse uno al otro hast
   - códigos equivocados: 40 por IP cada 10 minutos.
 - Que los códigos sean aleatorios. Son 33 millones de combinaciones, con el freno de intentos de arriba.
 - La **ficha privada** de cada jugador para reconectar. Es aleatoria y nunca se le manda al rival.
+- **E3.18 · Mejoras en línea:** solo se aceptan exactamente cuatro atributos con enteros 0..5.
+  - Decimales, negativos, más de 5 o claves de más: se rechazan y el jugador queda sin mejoras.
+  - Los multiplicadores no viajan: cada juego los calcula de la tabla. Así nadie puede mandar «velocidad ×10».
 
 **Lo que NO es (dicho tal cual):**
 
@@ -46,10 +60,39 @@ Esto se corrigió en E3.17. Antes, dos juegos podían empujarse uno al otro hast
   - El final por consenso evita que **uno solo** imponga el resultado.
   - Pero si el anfitrión engaña al invitado con fotos falsas, los dos podrían terminar de acuerdo en un resultado falso.
   - La protección completa exige simular el partido en el servidor (Godot sin pantalla), y eso no cabe bien en el plan gratuito (0.1 CPU). Es la ruta futura si algún día el online da premios.
+- **E3.18 · El servidor no puede saber si un jugador PAGÓ sus mejoras en línea**: no hay cuentas, y el progreso vive en cada teléfono.
+  - Un juego modificado podría declarar niveles altos sin haberlos comprado, pero nunca más allá del máximo (5).
+  - Comprobarlo exigiría cuentas y un progreso guardado en el servidor (fase futura).
 - **`Origin`, el código de sala y la versión del juego no son autenticación.**
   - La cabecera `Origin` solo frena que otras páginas web usen el servidor. La app de iPhone no la manda y siempre se acepta.
   - El código de sala solo sirve para encontrar la sala.
 - El online **no da** monedas, XP, premios ni progreso, y se juega con los valores base (sin mejoras compradas). Por eso esta protección se considera proporcionada para las pruebas privadas.
+
+## Verificación de compras (E3.18) · `POST /iap/verify`
+
+El iPhone manda `{"jws": "<transacción firmada por Apple>", "product": "<ID del producto>"}`. El servidor responde `{"verified": true|false, "reason", "product", "transactionId", "environment", "revoked"}`.
+
+Comprueba, sin claves secretas (`verificar_compras.js`):
+
+1. **Formato:** JWS ES256 con cadena de 3 certificados (`x5c`).
+2. **Raíz:** que sea exactamente **Apple Root CA - G3**, por su huella SHA-256 `63343ABF…3E9179`, publicada por Apple en [la lista de certificados raíz](https://support.apple.com/en-am/121672).
+3. **Cadena:** cada certificado firmado por el siguiente y vigente en la fecha de la transacción.
+4. **Marcas de Apple:** los OID `1.2.840.113635.100.6.11.1` (hoja) y `1.2.840.113635.100.6.2.1` (intermedio).
+5. **Firma** de la transacción.
+6. **Contenido:**
+   - app `com.eduardotoriello.tennispower`;
+   - producto pedido;
+   - consumible;
+   - entorno `Sandbox` (TestFlight) o `Production`;
+   - identificador de transacción;
+   - si está **reembolsada**.
+
+Detalles:
+
+- **Límite:** 30 verificaciones por minuto e IP.
+- **Registros:** solo «compra: verificada/rechazada (motivo)», nunca la transacción.
+- **Quién acredita:** el **teléfono**, una vez por `transactionId`, y guarda la lista en su progreso. El servidor no guarda nada.
+- **Pruebas:** usan una cadena **de prueba** (`pruebas/`). El servidor solo la acepta con `IAP_ALLOW_TEST_ROOT=1`, que **nunca** se pone en Render.
 
 ## Reinicios y límites del plan gratis
 
@@ -96,7 +139,7 @@ No se promete ninguna cantidad de jugadores hasta probarla en el servidor real.
 2. En la carpeta `server` ejecuta `npm install` y luego `npm start`. Debe aparecer `escuchando en 0.0.0.0:8090`.
 3. Abre dos veces el juego de pruebas (Godot o la web de pruebas): usa `ws://localhost:8090` solo.
 
-**Pruebas automáticas:** `npm test` (47 comprobaciones). Las pruebas del juego con este servidor real están en `tests/test_runner.gd` y se ejecutan con `--only=e317`.
+**Pruebas automáticas:** `npm test` (69 comprobaciones; E3.18 añade mejoras en línea, compatibilidad con el protocolo 2 y compras). Las pruebas del juego con este servidor real están en `tests/test_runner.gd` y se ejecutan con `--only=e317`.
 
 `prueba_retardo.js` es **solo para pruebas**: un intermediario que añade retraso de red.
 
@@ -112,6 +155,9 @@ Ver `.env.example`. No hay secretos.
 | `ALLOWED_ORIGINS` | Webs permitidas |
 | `MAX_ROOMS`, `MAX_CONNECTIONS`, `MAX_CONN_PER_IP` | Límites |
 | `RESUME_MS` | Cuánto se guarda el lugar de quien pierde la red |
+| `IAP_BUNDLE_ID` | App cuyas compras se aceptan (por defecto `com.eduardotoriello.tennispower`) |
+| `IAP_APP_APPLE_ID` | Opcional: número de la app; se comprueba en compras de Production |
+| `IAP_PER_MIN` | Verificaciones por minuto e IP (30) |
 
 ## Despliegue
 
