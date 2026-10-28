@@ -95,6 +95,7 @@ function verifyJws(jws, wantProduct, opts) {
     verified: true,
     product: payload.productId,
     transactionId: String(payload.transactionId),
+    originalTransactionId: payload.originalTransactionId != null ? String(payload.originalTransactionId) : "",
     environment: env,
     revoked: payload.revocationDate != null,
   };

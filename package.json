@@ -1,7 +1,7 @@
 {
   "name": "tennis-power-servidor-salas",
-  "version": "3.0.0",
-  "description": "Servidor de salas privadas 1 contra 1 de TENNIS POWER (WebSocket, protocolo 3; acepta 2) y verificación de compras de App Store.",
+  "version": "3.1.0",
+  "description": "Servidor de salas privadas 1 contra 1 de TENNIS POWER (WebSocket, protocolo 3; acepta 2), verificación de compras de App Store y registro permanente de entregas (PostgreSQL).",
   "main": "servidor_salas.js",
   "private": true,
   "license": "UNLICENSED",
@@ -10,9 +10,10 @@
   },
   "scripts": {
     "start": "node servidor_salas.js",
-    "test": "node prueba_servidor.js"
+    "test": "node prueba_servidor.js && node prueba_compras.js"
   },
   "dependencies": {
+    "pg": "^8.23.1",
     "ws": "^8.18.0"
   }
 }

@@ -1,4 +1,4 @@
-// TENNIS POWER · Servidor de salas privadas 1 contra 1 (E3.18 · protocolo 3, acepta también el 2)
+// TENNIS POWER · Servidor de salas privadas 1 contra 1 (E3.21 · protocolo 3, acepta también el 2)
 // ---------------------------------------------------------------------------------------------
 // Qué hace:
 //   - Crea salas con un código de 5 letras, deja entrar a UNA segunda persona y avisa quién está.
@@ -17,6 +17,10 @@
 //   - E3.18: cada jugador manda sus NIVELES de mejoras de multijugador (enteros 0..5 por atributo). El servidor
 //     solo acepta enteros en ese rango y se los pasa a los dos juegos en "start"; cada juego calcula los mismos
 //     multiplicadores con la misma tabla. (No puede saber si el jugador los compró: no hay cuentas.)
+//   - E3.20: reenvía en cada "in" el campo opcional "a" (holgura, retardo y ping del que manda) para que el otro
+//     juego ajuste su ritmo y su retardo de entrada en pleno partido (menos trabones). Juegos viejos lo ignoran.
+//   - E3.21: POST /iap/claim y /iap/ack: entrega de compras con REGISTRO PERMANENTE (registro_compras.js, PostgreSQL).
+//     Una transacción se entrega una sola vez y a un solo jugador. Sin base de datos configurada no autoriza entregas.
 //   - E3.18: POST /iap/verify verifica compras de App Store firmadas por Apple (ver verificar_compras.js).
 // No guarda nada en disco, no pide cuentas y no da monedas ni premios. Las salas viven en la memoria
 // de ESTE proceso: si el servidor se reinicia, las salas y partidos en curso se pierden (los juegos
@@ -36,6 +40,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const { verifyJws, optionsFromEnv } = require("./verificar_compras");
+const compras = require("./registro_compras"); // E3.21: registro permanente de entregas
 
 const PORT = parseInt(process.env.PORT || "8090", 10);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -338,7 +343,16 @@ function handleIn(ws, room, m) {
   room.nextK[idx] = k + d.length;
   room.touched = Date.now();
   const o = other(room, idx);
-  if (o && o.ws) send(o.ws, { t: "in", m: room.match, k, d });
+  const fwd = { t: "in", m: room.match, k, d };
+  if (validReport(m.a)) fwd.a = m.a; // E3.20: holgura y retardo del que manda (el otro juego ajusta su ritmo)
+  if (o && o.ws) send(o.ws, fwd);
+}
+
+// E3.20 · "a" = [holgura media ×10, holgura mala, retardo, ping] del juego que manda. Solo números enteros
+// pequeños; si no tiene esa forma no se reenvía (el partido sigue igual, sin ese dato).
+function validReport(a) {
+  return Array.isArray(a) && a.length === 4 && isInt(a[0], -600, 600) && isInt(a[1], -60, 60) &&
+    isInt(a[2], 2, 20) && isInt(a[3], 0, 5000);
 }
 
 function handleSync(ws, room, m) {
@@ -543,12 +557,14 @@ function iapTooMany(ip) {
   return arr.length > IAP_PER_MIN;
 }
 
-function handleVerify(req, res) {
-  const reply = (code, obj) => {
-    res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    res.end(JSON.stringify(obj));
-  };
-  if (iapTooMany(clientIp(req))) return reply(429, { verified: false, reason: "demasiadas" });
+function iapReply(res, code, obj) {
+  res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(obj));
+}
+
+// Lee el cuerpo JSON (máx. 32 KB) y llama a fn(m) o responde el error.
+function iapBody(req, res, fn) {
+  if (iapTooMany(clientIp(req))) return iapReply(res, 429, { verified: false, reason: "demasiadas", retry: true });
   let body = "";
   let tooBig = false;
   req.on("data", (c) => {
@@ -557,19 +573,78 @@ function handleVerify(req, res) {
     if (body.length > 32 * 1024) tooBig = true;
   });
   req.on("end", () => {
-    if (tooBig) return reply(413, { verified: false, reason: "tamano" });
+    if (tooBig) return iapReply(res, 413, { verified: false, reason: "tamano" });
     let m;
     try {
       m = JSON.parse(body);
     } catch (e) {
-      return reply(400, { verified: false, reason: "formato" });
+      return iapReply(res, 400, { verified: false, reason: "formato" });
     }
-    const r = verifyJws(m && m.jws, m && typeof m.product === "string" ? m.product : "", IAP_OPTS);
+    if (!m || typeof m !== "object") return iapReply(res, 400, { verified: false, reason: "formato" });
+    Promise.resolve(fn(m)).catch((e) => {
+      log("compra: registro no disponible (" + (e && e.code ? e.code : "error") + ")");
+      iapReply(res, 503, { verified: false, reason: "registro_no_disponible", retry: true });
+    });
+  });
+}
+
+// E3.21 · registro permanente (se conecta al primer uso; si la base está dormida se reintenta en la siguiente)
+const REG = compras.crearRegistro(process.env);
+let regIniciando = null;
+async function registro() {
+  if (!REG) return null;
+  if (REG.listo) return REG;
+  if (!regIniciando) regIniciando = REG.iniciar().finally(() => (regIniciando = null));
+  await regIniciando;
+  return REG;
+}
+
+// E3.18 (builds 3 a 5): solo verifica. E3.21: si la transacción ya está en el registro como de otro jugador,
+// responde que no se verifica (así un juego viejo no la acredita otra vez); si no está, la anota como
+// entregada a "legado" (el juego viejo la acredita en ese momento) para que ningún juego nuevo la repita.
+function handleVerify(req, res) {
+  iapBody(req, res, async (m) => {
+    const r = verifyJws(m.jws, typeof m.product === "string" ? m.product : "", IAP_OPTS);
     stats.iap = (stats.iap || 0) + 1;
+    if (r.verified && REG) {
+      const reg = await registro();
+      const ya = await reg.obtener(r.transactionId);
+      if (ya && ya.jugador !== "legado") {
+        log(`compra (juego anterior): ya registrada, no se repite ${r.product} ${r.environment}`);
+        return iapReply(res, 200, { verified: false, reason: "ya_registrada" });
+      }
+      const prod = compras.PRODUCTOS[r.product];
+      if (!ya && prod) {
+        await reg.reclamar({ transaction_id: r.transactionId, original_id: r.originalTransactionId || "", jugador: "legado", producto: r.product,
+          tipo: prod.tipo, cantidad: prod.cantidad, entorno: r.environment, estado: r.revoked ? "reembolsada_sin_entregar" : "entregada", reembolsada: !!r.revoked });
+      }
+    }
     if (r.verified) stats.iapOk = (stats.iapOk || 0) + 1;
     // nunca se registra la transacción completa; solo el resultado
-    log(`compra: ${r.verified ? "verificada" : "rechazada (" + r.reason + ")"}${r.verified ? " " + r.product + " " + r.environment : ""}`);
-    return reply(200, r);
+    log(`compra (juego anterior): ${r.verified ? "verificada" : "rechazada (" + r.reason + ")"}${r.verified ? " " + r.product + " " + r.environment : ""}`);
+    return iapReply(res, 200, r);
+  });
+}
+
+// E3.21 · POST /iap/claim {jws, player} → verifica con Apple (firma) y asigna la transacción a ese jugador.
+// POST /iap/ack {jws, player, action: "entregada" | "reembolso_aplicado"} → el teléfono confirma que ya guardó.
+function handleClaim(req, res, ack) {
+  iapBody(req, res, async (m) => {
+    const v = verifyJws(m.jws, "", IAP_OPTS);
+    stats.iap = (stats.iap || 0) + 1;
+    if (!v.verified) {
+      log(`compra: rechazada (${v.reason})`);
+      return iapReply(res, 200, v);
+    }
+    if (!REG) {
+      // sin base de datos permanente no se autoriza ninguna entrega: el teléfono la deja pendiente y reintenta
+      return iapReply(res, 503, { verified: true, ok: false, reason: "registro_sin_configurar", retry: true });
+    }
+    const reg = await registro();
+    const out = ack ? await compras.confirmar(reg, v, String(m.player || ""), String(m.action || "")) : await compras.reclamar(reg, v, String(m.player || ""));
+    if (out.ok && !ack) stats.iapOk = (stats.iapOk || 0) + 1;
+    log(`compra: ${ack ? "confirmación" : "entrega"} ${v.product} ${v.environment} → ${out.ok ? out.state : out.reason}`);
+    return iapReply(res, 200, out);
   });
 }
 
@@ -578,11 +653,14 @@ const server = http.createServer((req, res) => {
   if (path === "/" || path === "/health" || path === "/healthz") {
     // página de salud: Render la usa para saber que el servidor vive; el juego, para despertarlo
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    return res.end(JSON.stringify({ ok: true, juego: "TENNIS POWER", proto: PROTO, protos: PROTOS, boot: BOOT,
+    return res.end(JSON.stringify({ ok: true, juego: "TENNIS POWER", srv: "E3.21", proto: PROTO, protos: PROTOS, boot: BOOT,
       salas: rooms.size, conexiones: stats.conns, partidos: stats.matches, compras_verificadas: stats.iapOk || 0,
+      registro_compras: REG ? (REG.listo ? REG.tipo : REG.tipo + " (conectando)") : "sin_configurar",
       uptime_s: Math.round(process.uptime()) }));
   }
   if (path === "/iap/verify" && req.method === "POST") return handleVerify(req, res);
+  if (path === "/iap/claim" && req.method === "POST") return handleClaim(req, res, false);
+  if (path === "/iap/ack" && req.method === "POST") return handleClaim(req, res, true);
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("no");
 });
@@ -695,6 +773,6 @@ function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-server.listen(PORT, HOST, () => log(`TENNIS POWER · servidor de salas (protocolo ${PROTO}) escuchando en ${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => log(`TENNIS POWER · servidor de salas (protocolo ${PROTO}) escuchando en ${HOST}:${PORT} · registro de compras: ${REG ? REG.tipo : "SIN CONFIGURAR (no se entregan compras)"}`));
 
 module.exports = { PROTO, PROTOS };

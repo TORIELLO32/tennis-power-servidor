@@ -1,4 +1,4 @@
-# Servidor de salas y de compras · TENNIS POWER (E3.18 · protocolo 3, acepta el 2)
+# Servidor de salas y de compras · TENNIS POWER (E3.21 · protocolo 3, acepta el 2)
 
 El 1 contra 1 en línea necesita este pequeño servidor. Desde la E3.18 también **verifica las compras de App Store** antes de que el juego las acredite.
 
@@ -14,6 +14,8 @@ No guarda partidas, cuentas, monedas ni contraseñas.
 - **Revancha y salida:** organiza la revancha y avisa si el rival sale.
 - **E3.18 · Mejoras en línea:** cada jugador manda los NIVELES (0..5) de sus mejoras de multijugador. El servidor solo acepta enteros en ese rango y se los reparte a los dos juegos en el inicio del partido; cada juego calcula los mismos multiplicadores con la misma tabla.
 - **E3.18 · Compras:** `POST /iap/verify` comprueba una compra firmada por Apple (ver abajo).
+- **E3.20 · Ritmo:** cada mensaje de controles puede llevar `a` = [holgura media ×10, holgura mala, retardo, ping] del juego que lo manda. El servidor solo lo reenvía si son enteros pequeños en rango; con eso el otro juego ajusta su ritmo y su retardo en pleno partido. `/health` dice `"srv":"E3.21"` desde la E3.21.
+- **E3.21 · Registro permanente de compras:** `POST /iap/claim` y `POST /iap/ack` (ver abajo). Cada compra se entrega una sola vez y a un solo jugador. Necesita una base PostgreSQL (`DATABASE_URL`); sin ella verifica pero no autoriza entregas.
 
 ## Versiones (protocolo)
 
@@ -26,8 +28,8 @@ No guarda partidas, cuentas, monedas ni contraseñas.
 
 1. Los dos juegos simulan **el mismo partido**, con las mismas reglas, la misma semilla y los valores base de los personajes.
 2. Solo viajan los **controles**, numerados por tick (1/60 s) y con el **número de partido**. Un mensaje de un partido anterior nunca entra en la revancha.
-3. Cada control se aplica con un **retardo de entrada** igual para los dos, así que nadie tiene ventaja. El retardo se calcula con el ping real: de 3 a 15 ticks (50–250 ms).
-4. Si falta un control del rival, el juego **espera** en vez de inventarlo, y avisa «Esperando a tu rival…».
+3. Cada control se aplica con un **retardo de entrada**. Empieza igual para los dos, calculado con el ping real (de 3 a 15 ticks, 50–250 ms). **E3.20:** durante el partido cada juego ajusta el suyo según cómo le llegan sus controles al rival (de 3 a 20 ticks).
+4. **E3.20:** si un control del rival se atrasa por un tirón de la red, el juego lo **prevé** (el rival sigue haciendo lo mismo) hasta 200 ms. Cuando llega el real, vuelve a la última foto confirmada y lo re-simula: el estado final es exactamente el mismo. Si el retraso pasa de 200 ms, **espera** y avisa «Esperando a tu rival…».
 5. Cada medio segundo, el invitado manda una **huella** de su estado. Si no coincide con la del anfitrión, el anfitrión le manda una **foto** del estado.
    - El invitado solo acepta fotos con la **forma exacta** de su simulador: clases de una lista fija, las mismas variables y los mismos tipos.
 
@@ -93,6 +95,27 @@ Detalles:
 - **Registros:** solo «compra: verificada/rechazada (motivo)», nunca la transacción.
 - **Quién acredita:** el **teléfono**, una vez por `transactionId`, y guarda la lista en su progreso. El servidor no guarda nada.
 - **Pruebas:** usan una cadena **de prueba** (`pruebas/`). El servidor solo la acepta con `IAP_ALLOW_TEST_ROOT=1`, que **nunca** se pone en Render.
+
+## Registro permanente de compras (E3.21) · `POST /iap/claim` y `POST /iap/ack`
+
+Archivo: `registro_compras.js`. Pruebas: `node prueba_compras.js` (con `TEST_DATABASE_URL` también prueba PostgreSQL).
+
+**Por qué:** antes solo el teléfono recordaba qué compras había entregado. Un respaldo viejo, una reinstalación u otro teléfono con el mismo Apple ID podían volver a recibir la misma compra, y nadie podía recuperar una entrega interrumpida con seguridad.
+
+**Cómo funciona:**
+
+1. El juego manda la transacción firmada por Apple y su **identificador de jugador** (32 letras al azar que se crean una vez y viajan dentro del progreso y del código de exportar; no hay cuenta, correo ni contraseña).
+2. `/iap/claim` verifica la firma (igual que `/iap/verify`) y la **registra** en PostgreSQL a nombre de ese jugador, con su contenido fijo (tabla `PRODUCTOS`: un identificador de Apple nunca cambia de contenido). Si ya era de otro jugador, responde `otro_jugador` y no se entrega.
+3. El juego suma y **guarda** su progreso. Solo entonces llama a `/iap/ack` con `entregada`.
+4. Si Apple avisa un reembolso, la fila pasa a `reembolso_pendiente`; el juego retira lo que esa compra dio y confirma `reembolso_aplicado`.
+
+**Estados:** `reclamada` → `entregada`; `reembolso_pendiente` → `reembolso_aplicado`; `reembolsada_sin_entregar`.
+
+**Dónde se guarda:** solo en PostgreSQL (`DATABASE_URL`). El disco del plan gratis de Render se borra al reiniciar, así que ahí nunca se usa un archivo (`IAP_LEDGER_FILE` es solo para pruebas locales y Render lo rechaza). Sin base, `/iap/claim` responde 503 `registro_sin_configurar` y el teléfono deja la compra pendiente (no se pierde).
+
+**Base gratis recomendada:** Neon (plan Free: 1 GB por proyecto y 100 horas de cómputo al mes; se duerme a los 5 minutos sin uso y despierta sola). Cada compra ocupa menos de 1 KB: miles de compras caben de sobra. Ver `GUIA_RENDER.md` → «Registro de compras».
+
+**Juegos anteriores (builds 3 a 5):** siguen usando `/iap/verify`. Si la transacción ya está registrada a un jugador, ahora responden «no verificada» (así no la acreditan otra vez); si no está, se anota como entregada a «legado».
 
 ## Reinicios y límites del plan gratis
 
